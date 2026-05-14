@@ -1,0 +1,308 @@
+"""
+chimera/regime/classifier.py
+RegimeClassifier — detects the current market regime from OHLCV data
+and macro signals in SharedState.
+
+Signal inputs:
+  1. ADX (Average Directional Index)
+     < 20: ranging/mean-reverting
+     20–25: transitional
+     > 25: trending (direction determined by EMA ribbon)
+
+  2. EMA ribbon alignment (9 / 20 / 50 / 200)
+     All aligned bullish (close > EMA9 > EMA20 > EMA50 > EMA200) → BULL
+     All aligned bearish → BEAR
+     Mixed → neutral or mean-reverting
+
+  3. Volatility proxy (ATR / close ratio)
+     > threshold → HIGH_VOLATILITY
+     This is a cheap VIX proxy when actual VIX data is unavailable.
+     Configure vix_proxy_threshold in config (default 0.025 = 2.5% ATR/price).
+
+  4. BTC dominance proxy (optional)
+     If BTC/USD is in a strong uptrend while altcoins are flat or down,
+     treat as RISK-OFF → HIGH_VOLATILITY for crypto sector.
+
+  5. Market breadth proxy
+     Uses the ratio of symbols above their EMA200 across the watchlist.
+     > 60% above → bullish breadth
+     < 40% above → bearish breadth
+
+Classification algorithm:
+  1. If ATR/price > vix_proxy_threshold → HIGH_VOLATILITY (overrides all)
+  2. If ADX > 25 and EMA ribbon bullish → TRENDING_BULL
+  3. If ADX > 25 and EMA ribbon bearish → TRENDING_BEAR
+  4. If ADX < 20 → MEAN_REVERTING
+  5. Otherwise → NEUTRAL
+
+The regime is updated on a configurable interval (default 15 minutes)
+to avoid thrashing between states on short-term noise.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+from datetime import datetime, timezone
+from typing import Any, TYPE_CHECKING
+
+import numpy as np
+
+from chimera_v12.regime.models import Regime, RegimeState
+from chimera_v12.utils.ta import ema, adx, atr_value
+from chimera_v12.utils.logger import setup_logger
+
+if TYPE_CHECKING:
+    from chimera_v12.utils.state import SharedState
+
+log = setup_logger("regime.classifier")
+
+# Default classification thresholds
+DEFAULT_THRESHOLDS = {
+    "adx_trending":        25.0,    # ADX above this = trending regime
+    "adx_ranging":         20.0,    # ADX below this = ranging / mean-reverting
+    "vix_proxy_high_vol":  0.025,   # ATR/price above this = high volatility
+    "breadth_bull":        0.60,    # fraction of symbols above EMA200 = bull breadth
+    "breadth_bear":        0.40,    # below this = bear breadth
+    "min_bars_required":   200,     # bars needed before regime is meaningful
+    "update_interval_min": 15,      # minutes between regime updates
+    "smoothing_periods":   3,       # regime must hold for N consecutive periods
+}
+
+
+class RegimeClassifier:
+    """
+    Classifies the current market regime from shared market data.
+    Runs as an asyncio task, updating RegimeState on a configurable interval.
+
+    Smoothing: the classifier uses a "persistence" mechanism — a new regime
+    must be detected for `smoothing_periods` consecutive evaluations before
+    being committed to SharedState. This prevents whipsawing.
+    """
+
+    def __init__(self, state: "SharedState", config: dict[str, Any]):
+        self.state  = state
+        self.config = config
+
+        # Merge config thresholds with defaults
+        self.t = {**DEFAULT_THRESHOLDS}
+        for k in DEFAULT_THRESHOLDS:
+            if k in config:
+                self.t[k] = config[k]
+
+        self._interval_sec = self.t["update_interval_min"] * 60
+        self._candidate:   Regime | None = None   # pending regime
+        self._candidate_count: int       = 0       # consecutive periods at candidate
+
+        # Initialise regime state in SharedState
+        if not hasattr(self.state, "regime_state"):
+            self.state.regime_state = RegimeState()
+
+    async def run(self) -> None:
+        log.info(
+            f"RegimeClassifier started — "
+            f"update every {self.t['update_interval_min']} min, "
+            f"smoothing={self.t['smoothing_periods']} periods"
+        )
+        while True:
+            try:
+                await self._classify()
+            except Exception as e:
+                log.warning(f"RegimeClassifier error: {e}")
+            await asyncio.sleep(self._interval_sec)
+
+    # ── Classification pipeline ───────────────────────────────────────────────
+
+    async def _classify(self) -> None:
+        """Run one classification cycle across all available market data."""
+        signals = self._gather_signals()
+        regime, confidence, reason = self._decide(signals)
+
+        # Smoothing: only commit after N consecutive periods
+        if regime == self._candidate:
+            self._candidate_count += 1
+        else:
+            self._candidate       = regime
+            self._candidate_count = 1
+
+        if self._candidate_count >= self.t["smoothing_periods"]:
+            old = self.state.regime_state.regime
+            self._commit(regime, confidence, signals, reason)
+            if old != regime:
+                log.info(
+                    f"Regime change: {old.value} → {regime.value} "
+                    f"(confidence={confidence:.2f}) — {reason}"
+                )
+
+    def _gather_signals(self) -> dict[str, Any]:
+        """
+        Extract all available regime signals from SharedState.
+        Returns a dict of signal values; missing data returns safe defaults.
+        """
+        # Collect across all sectors, weighted toward the primary index proxy
+        adx_values:         list[float] = []
+        ema_bull_count:     int         = 0
+        ema_bear_count:     int         = 0
+        symbol_count:       int         = 0
+        above_ema200_count: int         = 0
+        vix_proxies:        list[float] = []
+
+        for sector_data in [
+            self.state.market.stocks,
+            self.state.market.crypto,
+            self.state.market.futures,
+        ]:
+            for sym, bars in sector_data.items():
+                if sym.startswith("_"):
+                    continue
+                closes = bars.get("close", [])
+                highs  = bars.get("high",  [])
+                lows   = bars.get("low",   [])
+                n_req  = int(self.t["min_bars_required"])
+
+                if len(closes) < n_req:
+                    continue
+
+                c = np.array(closes, dtype=float)
+                h = np.array(highs,  dtype=float)
+                l = np.array(lows,   dtype=float)
+
+                symbol_count += 1
+
+                # ADX
+                adx_val = adx(h, l, c, period=14)
+                adx_values.append(adx_val)
+
+                # EMA ribbon
+                e9   = ema(c, 9)[-1]
+                e20  = ema(c, 20)[-1]
+                e50  = ema(c, 50)[-1]
+                e200 = ema(c, 200)[-1]
+                price = c[-1]
+
+                if price > e9 > e20 > e50 > e200:
+                    ema_bull_count += 1
+                elif price < e9 < e20 < e50 < e200:
+                    ema_bear_count += 1
+
+                if price > e200:
+                    above_ema200_count += 1
+
+                # Volatility proxy
+                atr = atr_value(h, l, c, period=14)
+                if price > 0:
+                    vix_proxies.append(atr / price)
+
+        n = max(symbol_count, 1)
+
+        return {
+            "adx_mean":       float(np.mean(adx_values)) if adx_values else 0.0,
+            "adx_values":     adx_values,
+            "ema_bull_frac":  ema_bull_count  / n,
+            "ema_bear_frac":  ema_bear_count  / n,
+            "breadth":        above_ema200_count / n,
+            "vix_proxy_mean": float(np.mean(vix_proxies)) if vix_proxies else 0.0,
+            "symbol_count":   symbol_count,
+            "btc_inflow":     self.state.market.crypto.get("btc_exchange_inflow", 0),
+        }
+
+    def _decide(
+        self,
+        s: dict[str, Any],
+    ) -> tuple[Regime, float, str]:
+        """
+        Apply classification rules in priority order.
+        Returns (regime, confidence, reason).
+        """
+        adx_mean    = s["adx_mean"]
+        bull_frac   = s["ema_bull_frac"]
+        bear_frac   = s["ema_bear_frac"]
+        breadth     = s["breadth"]
+        vix_proxy   = s["vix_proxy_mean"]
+        btc_inflow  = s["btc_inflow"]
+        n           = s["symbol_count"]
+
+        if n == 0:
+            return Regime.NEUTRAL, 0.0, "insufficient data"
+
+        # Rule 1: High volatility override
+        hv_thresh = self.t["vix_proxy_high_vol"]
+        if vix_proxy > hv_thresh:
+            conf   = min(1.0, (vix_proxy / hv_thresh - 1) * 2 + 0.5)
+            reason = f"ATR/price={vix_proxy:.3f} > {hv_thresh}"
+            # BTC inflow amplifies high-vol signal
+            if btc_inflow > self.config.get("btc_inflow_threshold", 1_000_000):
+                conf   = min(1.0, conf + 0.15)
+                reason += f"; BTC exchange inflow ${btc_inflow:,.0f}"
+            return Regime.HIGH_VOLATILITY, round(conf, 3), reason
+
+        # Rule 2: Trending bull
+        adx_thresh = self.t["adx_trending"]
+        if (adx_mean > adx_thresh and
+                bull_frac > 0.5 and
+                breadth > self.t["breadth_bull"]):
+            conf = min(1.0, (adx_mean - adx_thresh) / 20 + bull_frac * 0.3)
+            reason = (
+                f"ADX={adx_mean:.1f}, "
+                f"{bull_frac*100:.0f}% symbols EMA-bull, "
+                f"breadth={breadth:.2f}"
+            )
+            return Regime.TRENDING_BULL, round(conf, 3), reason
+
+        # Rule 3: Trending bear
+        if (adx_mean > adx_thresh and
+                bear_frac > 0.5 and
+                breadth < self.t["breadth_bear"]):
+            conf = min(1.0, (adx_mean - adx_thresh) / 20 + bear_frac * 0.3)
+            reason = (
+                f"ADX={adx_mean:.1f}, "
+                f"{bear_frac*100:.0f}% symbols EMA-bear, "
+                f"breadth={breadth:.2f}"
+            )
+            return Regime.TRENDING_BEAR, round(conf, 3), reason
+
+        # Rule 4: Mean reverting
+        if adx_mean < self.t["adx_ranging"]:
+            conf   = max(0.3, 1.0 - adx_mean / self.t["adx_ranging"])
+            reason = f"ADX={adx_mean:.1f} (ranging, low trend strength)"
+            return Regime.MEAN_REVERTING, round(conf, 3), reason
+
+        # Rule 5: Neutral
+        conf   = 0.3 + min(0.3, adx_mean / 100)
+        reason = (
+            f"ADX={adx_mean:.1f} (transitional), "
+            f"bull={bull_frac:.2f} bear={bear_frac:.2f}"
+        )
+        return Regime.NEUTRAL, round(conf, 3), reason
+
+    def _commit(
+        self,
+        regime:     Regime,
+        confidence: float,
+        signals:    dict[str, Any],
+        reason:     str,
+    ) -> None:
+        """Write the new regime to SharedState."""
+        self.state.regime_state = RegimeState(
+            regime     = regime,
+            confidence = confidence,
+            adx        = round(signals.get("adx_mean", 0), 1),
+            ema_bull   = signals.get("ema_bull_frac", 0) > 0.5,
+            ema_bear   = signals.get("ema_bear_frac", 0) > 0.5,
+            vix_proxy  = round(signals.get("vix_proxy_mean", 0), 4),
+            btc_dom    = 0.0,   # placeholder — wire to CMC data if available
+            updated_at = datetime.now(timezone.utc).isoformat(),
+            reason     = reason,
+        )
+        # Also update the legacy SharedState.regime field for compatibility
+        self.state.regime = regime
+
+    def classify_once(self) -> RegimeState:
+        """
+        Synchronous single classification — useful for backtesting
+        and testing without running the full async loop.
+        """
+        signals = self._gather_signals()
+        regime, confidence, reason = self._decide(signals)
+        self._commit(regime, confidence, signals, reason)
+        return self.state.regime_state
